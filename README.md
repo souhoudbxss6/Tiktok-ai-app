@@ -1,2 +1,410 @@
 # Tiktok-ai-app
 Créer d'une application 
+"""
+============================================================
+  TikTok AI Poster - Application principale (Flask)
+============================================================
+Application unique et complète qui permet de :
+  1. Connecter son compte TikTok (OAuth2)
+  2. Choisir une niche parmi plusieurs types de vidéos virales
+  3. Générer chaque jour une vidéo COMPLÈTE (script + voix/visuels
+     + montage) via le meilleur générateur vidéo IA disponible
+     (HeyGen, Runway, ou Pexels+ElevenLabs en secours)
+  4. Planifier et publier automatiquement aux heures où l'audience
+     TikTok est la plus active
+
+⚠️ À CONFIGURER (variables d'environnement, voir README.md) :
+  TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET, TIKTOK_REDIRECT_URI,
+  ANTHROPIC_API_KEY, et AU MOINS UN générateur vidéo parmi :
+  (HEYGEN_API_KEY + HEYGEN_AVATAR_ID) / RUNWAYML_API_SECRET /
+  (PEXELS_API_KEY + ELEVENLABS_API_KEY)
+============================================================
+"""
+
+import os
+import shutil
+import sqlite3
+import secrets
+from datetime import datetime
+
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    session, send_from_directory, flash,
+)
+from apscheduler.schedulers.background import BackgroundScheduler
+
+import requests as http_requests
+
+from niches import NICHES
+from ai_engine import generate_complete_video
+from scheduler_logic import get_next_optimal_slots
+import video_providers
+
+# ------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(16))
+
+BASE_DIR = os.path.dirname(__file__)
+DB_PATH = os.path.join(BASE_DIR, "database.db")
+MEDIA_DIR = os.path.join(BASE_DIR, "media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
+
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "REMPLACE_MOI")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "REMPLACE_MOI")
+TIKTOK_REDIRECT_URI = os.environ.get("TIKTOK_REDIRECT_URI", "http://localhost:5000/auth/callback")
+
+TIKTOK_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+TIKTOK_UPLOAD_INIT_URL = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+
+PROVIDER_CHOICES = [
+    ("auto", "Automatique (le meilleur disponible)"),
+    ("heygen", "HeyGen — avatar IA (voix + visage)"),
+    ("runway", "Runway — clip cinématique généré par IA"),
+    ("broll", "Pexels + ElevenLabs — vidéos réelles + voix IA"),
+]
+
+
+# ------------------------------------------------------------------
+# Base de données (SQLite)
+# ------------------------------------------------------------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tiktok_open_id TEXT UNIQUE,
+            access_token TEXT,
+            refresh_token TEXT,
+            niche TEXT,
+            preferred_provider TEXT DEFAULT 'auto',
+            timezone TEXT DEFAULT 'Europe/Paris',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            niche TEXT,
+            title TEXT,
+            script TEXT,
+            video_path TEXT,
+            provider_used TEXT,
+            status TEXT DEFAULT 'draft',       -- draft | ready | scheduled | posted | failed
+            scheduled_at TEXT,
+            posted_at TEXT,
+            error_message TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------------------
+# Pipeline de génération complète (script + vidéo)
+# ------------------------------------------------------------------
+def run_generation_pipeline(conn, user_row):
+    """Génère une vidéo complète pour un utilisateur et l'enregistre en base."""
+    niche_id = user_row["niche"] or "storytelling"
+    provider_pref = user_row["preferred_provider"] or "auto"
+
+    try:
+        result = generate_complete_video(niche_id, provider_pref)
+
+        # On déplace la vidéo générée (fichier temporaire) vers le
+        # dossier persistant "media/" de l'application
+        final_name = f"user{user_row['id']}_{secrets.token_hex(6)}.mp4"
+        final_path = os.path.join(MEDIA_DIR, final_name)
+        shutil.move(result["video_path"], final_path)
+
+        slots = get_next_optimal_slots(user_row["timezone"], count=1)
+        scheduled_at = slots[0].isoformat() if slots else None
+
+        conn.execute(
+            """INSERT INTO videos
+               (user_id, niche, title, script, video_path, provider_used, status, scheduled_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                user_row["id"], niche_id, result["title"], result["script"],
+                final_name, result["provider_used"], "scheduled", scheduled_at,
+            ),
+        )
+        conn.commit()
+        return True, None
+
+    except video_providers.ProviderUnavailable as e:
+        conn.execute(
+            """INSERT INTO videos (user_id, niche, title, status, error_message)
+               VALUES (?,?,?,?,?)""",
+            (user_row["id"], niche_id, "Échec de génération", "failed", str(e)),
+        )
+        conn.commit()
+        return False, str(e)
+
+
+# ------------------------------------------------------------------
+# Pages principales
+# ------------------------------------------------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/niches")
+def niches_page():
+    return render_template("niches.html", niches=NICHES)
+
+
+@app.route("/niches/select", methods=["POST"])
+def select_niche():
+    niche_id = request.form.get("niche_id")
+    session["selected_niche"] = niche_id
+    if "user_id" in session:
+        conn = get_db()
+        conn.execute("UPDATE users SET niche = ? WHERE id = ?", (niche_id, session["user_id"]))
+        conn.commit()
+        conn.close()
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    if "user_id" not in session:
+        return redirect(url_for("index"))
+
+    conn = get_db()
+    if request.method == "POST":
+        provider = request.form.get("preferred_provider", "auto")
+        timezone = request.form.get("timezone", "Europe/Paris")
+        conn.execute(
+            "UPDATE users SET preferred_provider=?, timezone=? WHERE id=?",
+            (provider, timezone, session["user_id"]),
+        )
+        conn.commit()
+        flash("Préférences mises à jour.")
+
+    user = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    conn.close()
+    return render_template("settings.html", user=user, providers=PROVIDER_CHOICES)
+
+
+# ------------------------------------------------------------------
+# Authentification TikTok (OAuth2)
+# ------------------------------------------------------------------
+@app.route("/auth/login")
+def tiktok_login():
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    params = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "response_type": "code",
+        "scope": "user.info.basic,video.publish,video.upload",
+        "redirect_uri": TIKTOK_REDIRECT_URI,
+        "state": state,
+    }
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    return redirect(f"{TIKTOK_AUTH_URL}?{query}")
+
+
+@app.route("/auth/callback")
+def tiktok_callback():
+    code = request.args.get("code")
+    state = request.args.get("state")
+
+    if state != session.get("oauth_state"):
+        return "État OAuth invalide, connexion refusée.", 400
+    if not code:
+        return "Autorisation TikTok refusée.", 400
+
+    payload = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "client_secret": TIKTOK_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": TIKTOK_REDIRECT_URI,
+    }
+    resp = http_requests.post(TIKTOK_TOKEN_URL, data=payload, timeout=15)
+    data = resp.json()
+
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    open_id = data.get("open_id")
+
+    conn = get_db()
+    row = conn.execute("SELECT id FROM users WHERE tiktok_open_id = ?", (open_id,)).fetchone()
+    if row:
+        user_id = row["id"]
+        conn.execute(
+            "UPDATE users SET access_token=?, refresh_token=? WHERE id=?",
+            (access_token, refresh_token, user_id),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO users (tiktok_open_id, access_token, refresh_token) VALUES (?,?,?)",
+            (open_id, access_token, refresh_token),
+        )
+        user_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    session["user_id"] = user_id
+    return redirect(url_for("niches_page"))
+
+
+# ------------------------------------------------------------------
+# Tableau de bord
+# ------------------------------------------------------------------
+@app.route("/dashboard")
+def dashboard():
+    if "user_id" not in session:
+        return redirect(url_for("index"))
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    videos = conn.execute(
+        "SELECT * FROM videos WHERE user_id=? ORDER BY id DESC LIMIT 20", (session["user_id"],)
+    ).fetchall()
+    conn.close()
+
+    return render_template("dashboard.html", user=user, videos=videos)
+
+
+@app.route("/videos/generate", methods=["POST"])
+def generate_video_now():
+    if "user_id" not in session:
+        return redirect(url_for("index"))
+
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    success, error = run_generation_pipeline(conn, user)
+    conn.close()
+
+    if not success:
+        flash(f"Échec de la génération vidéo : {error}")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/media/<path:filename>")
+def serve_media(filename):
+    """Permet de prévisualiser une vidéo générée depuis le tableau de bord."""
+    return send_from_directory(MEDIA_DIR, filename)
+
+
+# ------------------------------------------------------------------
+# Tâches planifiées : génération + publication automatique quotidienne
+# ------------------------------------------------------------------
+def daily_auto_pipeline():
+    """Génère automatiquement une vidéo par utilisateur ayant une niche définie."""
+    conn = get_db()
+    users = conn.execute("SELECT * FROM users WHERE niche IS NOT NULL").fetchall()
+    for user in users:
+        run_generation_pipeline(conn, user)
+    conn.close()
+
+
+def publish_due_videos():
+    """
+    Publie sur TikTok les vidéos dont l'heure planifiée est arrivée,
+    en uploadant le fichier vidéo réel généré par l'IA.
+    """
+    conn = get_db()
+    now = datetime.utcnow().isoformat()
+    due_videos = conn.execute(
+        "SELECT * FROM videos WHERE status='scheduled' AND scheduled_at <= ?", (now,)
+    ).fetchall()
+
+    for video in due_videos:
+        user = conn.execute("SELECT * FROM users WHERE id=?", (video["user_id"],)).fetchone()
+        video_file_path = os.path.join(MEDIA_DIR, video["video_path"] or "")
+
+        if not os.path.isfile(video_file_path):
+            conn.execute(
+                "UPDATE videos SET status='failed', error_message=? WHERE id=?",
+                ("Fichier vidéo introuvable.", video["id"]),
+            )
+            conn.commit()
+            continue
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {user['access_token']}",
+                "Content-Type": "application/json; charset=UTF-8",
+            }
+            video_size = os.path.getsize(video_file_path)
+
+            # Étape 1 : initialisation de l'upload auprès de TikTok
+            init_payload = {
+                "post_info": {"title": video["title"], "privacy_level": "PUBLIC_TO_EVERYONE"},
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": video_size,
+                    "chunk_size": video_size,
+                    "total_chunk_count": 1,
+                },
+            }
+            init_resp = http_requests.post(
+                TIKTOK_UPLOAD_INIT_URL, headers=headers, json=init_payload, timeout=15
+            )
+            init_data = init_resp.json().get("data", {})
+            upload_url = init_data.get("upload_url")
+
+            if not upload_url:
+                raise RuntimeError(f"Réponse d'initialisation TikTok invalide : {init_resp.text[:300]}")
+
+            # Étape 2 : upload du fichier vidéo réel vers l'URL fournie
+            with open(video_file_path, "rb") as f:
+                video_bytes = f.read()
+            http_requests.put(
+                upload_url,
+                data=video_bytes,
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
+                },
+                timeout=120,
+            )
+
+            conn.execute(
+                "UPDATE videos SET status='posted', posted_at=? WHERE id=?",
+                (datetime.utcnow().isoformat(), video["id"]),
+            )
+        except Exception as e:
+            conn.execute(
+                "UPDATE videos SET status='failed', error_message=? WHERE id=?",
+                (str(e), video["id"]),
+            )
+            print(f"[Erreur publication] vidéo {video['id']}: {e}")
+
+    conn.commit()
+    conn.close()
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_auto_pipeline, "cron", hour=5, minute=0)   # génère les vidéos du jour à 5h
+scheduler.add_job(publish_due_videos, "interval", minutes=5)       # vérifie les publications à faire
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+# Initialisation exécutée que le site soit lancé localement (python app.py)
+# ou via gunicorn (comme sur Render)
+init_db()
+scheduler.start()
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+
