@@ -1,0 +1,11 @@
+flask
+apscheduler
+requests
+anthropic
+pytz
+gunicorn
+
+# Fournisseurs de génération vidéo (installe ceux que tu utilises)
+runwayml
+elevenlabs
+moviepy
