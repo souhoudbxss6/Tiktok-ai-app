@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Accueil{% endblock %}
+{% block content %}
+<section class="hero">
+    <h1>Automatise tes vidéos virales TikTok avec l'IA</h1>
+    <p>Connecte ton compte, choisis ta niche, et laisse l'IA générer et
+       planifier tes vidéos aux meilleures heures de publication.</p>
+    <a class="btn-primary" href="{{ url_for('tiktok_login') }}">
+        Connecter mon compte TikTok
+    </a>
+</section>
+{% endblock %}
