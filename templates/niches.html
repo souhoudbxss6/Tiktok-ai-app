@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Choisir ma niche{% endblock %}
+{% block content %}
+<section>
+    <h1>Choisis le type de vidéo virale que l'IA va créer pour toi</h1>
+    <form method="POST" action="{{ url_for('select_niche') }}">
+        <div class="niches-grid">
+            {% for niche in niches %}
+            <label class="niche-card">
+                <input type="radio" name="niche_id" value="{{ niche.id }}" required>
+                <h3>{{ niche.titre }}</h3>
+                <p>{{ niche.description }}</p>
+                <span class="duree">⏱ {{ niche.duree_conseillee }}</span>
+            </label>
+            {% endfor %}
+        </div>
+        <button type="submit" class="btn-primary">Valider ma niche</button>
+    </form>
+</section>
+{% endblock %}
