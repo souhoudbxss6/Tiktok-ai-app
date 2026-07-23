@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Tableau de bord{% endblock %}
+{% block content %}
+<section>
+    <h1>Ton tableau de bord</h1>
+    <p>
+        Niche actuelle : <strong>{{ user.niche or "Aucune sélectionnée" }}</strong> —
+        Générateur : <strong>{{ user.preferred_provider or "auto" }}</strong>
+        (<a href="{{ url_for('settings') }}">modifier</a>)
+    </p>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="flash">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" action="{{ url_for('generate_video_now') }}">
+        <button type="submit" class="btn-primary">✨ Générer une vidéo complète maintenant</button>
+    </form>
+
+    <h2>Vidéos récentes</h2>
+    <table class="videos-table">
+        <thead>
+            <tr>
+                <th>Aperçu</th>
+                <th>Titre</th>
+                <th>Générateur</th>
+                <th>Statut</th>
+                <th>Planifiée pour</th>
+                <th>Publiée le</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for video in videos %}
+            <tr>
+                <td>
+                    {% if video.video_path %}
+                    <video width="90" controls src="{{ url_for('serve_media', filename=video.video_path) }}"></video>
+                    {% else %}
+                    —
+                    {% endif %}
+                </td>
+                <td>
+                    {{ video.title }}
+                    {% if video.error_message %}
+                        <div class="error-msg">{{ video.error_message }}</div>
+                    {% endif %}
+                </td>
+                <td>{{ video.provider_used or "-" }}</td>
+                <td><span class="status status-{{ video.status }}">{{ video.status }}</span></td>
+                <td>{{ video.scheduled_at or "-" }}</td>
+                <td>{{ video.posted_at or "-" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6">Aucune vidéo pour le moment.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}
